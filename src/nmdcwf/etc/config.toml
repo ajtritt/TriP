@@ -1,5 +1,10 @@
+[global]
+cw_jar = '/global/common/software/m3408/cromwell-54.jar'
+
 [qc]
-database = '/global/cfs/projectdirs/m3408/aim2/database'
+database = '$CFS/m3408/aim2/database'
+wdl = '$HOME/projects/TriP/ReadsQC.git/rqcfilter.wdl'
+shifter_conf = '$HOME/projects/TriP/cromwell_jaws_shifter.conf'
 
 [assembly]
 

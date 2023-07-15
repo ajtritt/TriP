@@ -1,20 +1,40 @@
 import abc
 import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import tomllib
 
-class CromwellJob(abc.ABCMeta):
+class CromwellJob(metaclass=abc.ABCMeta):
 
-    cw_jar = "/global/common/software/m3408/cromwell-54.jar"
+    job_type = None
 
-    def __init__(self, inputs_dict, config, **xx_args):
+    def __init__(self, inputs_dict, config, sample, **xx_args):
+        assert self.job_type is not None
         self.inputs = inputs_dict
         self.wdl = config['wdl']
+        self.cw_jar = config['cw_jar']
         self.shifter_conf = config['shifter_conf']
         self.xx_args = xx_args
         self.outdir = None
         self.jobid = None
+        self.sample = sample
+
+    @staticmethod
+    def load_config(config_file):
+        with open(config_file, 'rb') as f:
+            config = tomllib.load(f)
+
+        global_conf = config.pop('global', dict())
+        for conf in config.values():
+            conf.update(global_conf)
+
+        return config
 
     @classmethod
-    def write_sbatch(cls, f, outbase, wdl, shifter_conf, time=720, dep=None, **xx):
+    def write_sbatch(cls, f, outbase, wdl, shifter_conf, cw_jar, time=720, dep=None, qos='regular', env=None, **xx):
         """
         The inputs JSON is expected to be in the directory that the job will change into
 
@@ -28,7 +48,8 @@ class CromwellJob(abc.ABCMeta):
         write = lambda s="": print(s, file=f)
 
         write("#!/bin/bash")
-        kwargs['qos'] = 'regular'
+        kwargs = dict()
+        kwargs['qos'] = qos
         kwargs['time'] = time
         kwargs['output'] = f"{outbase}.%j.log"
         kwargs['error'] = kwargs['output']
@@ -39,26 +60,41 @@ class CromwellJob(abc.ABCMeta):
         kwargs['mail-user'] = 'ajtritt@lbl.gov'
         kwargs['constraint'] = 'cpu'
         kwargs['account'] = 'm3408'
-        kwargs['job-name'] = job_name
+        kwargs['job-name'] = cls.job_type + "." + os.path.basename(outbase)
         if dep is not None:
             kwargs['dependency'] = dep
         for k, v in kwargs.items():
             write(f"#SBATCH --{k}={v}")
         write()
+        if isinstance(env, dict):
+            for k, v in env.items():
+                write(f"export {k}={v}")
+            write()
         write(f"cd {outbase}.$SLURM_JOB_ID")
         write()
         xx_args = " ".join([f"-XX:{k}={v}" for k, v in xx.items()])
 
-        write(f"java {xx_args} -Dconfig.file={shifter_conf} -jar {cls.cw_jar} run -m metadata.json -i inputs.json {wdl}")
+        write(f"java {xx_args} -Dconfig.file={shifter_conf} -jar {cw_jar} run -m metadata.json -i inputs.json {wdl}")
 
-        return tmp_sh
-
-    def submit_workflow(self, outbase, submit=True, dep=None):
+    def submit_workflow(self, outbase, submit=True, dep=None, debug=False, **extra_kwargs):
         inputs_f, inputs_path = tempfile.mkstemp(suffix='.json')
+        inputs_f = tempfile.NamedTemporaryFile('w', suffix='.json')
+        inputs_path = inputs_f.name
         json.dump(self.inputs, inputs_f, indent=2)
+        inputs_f.flush()
 
-        sh_f, sh_path = tempfile.mkstemp(suffix='.sh')
-        self.write_sbatch(sh, outbase, self.wdl, self.shifter_conf, dep=dep, **self.xx_args)
+        sh_f = tempfile.NamedTemporaryFile('w', suffix='.sh')
+        sh_path = sh_f.name
+        kwargs = {'dep': dep}
+        kwargs.update(self.xx_args)
+        if debug:
+            kwargs['time'] = 20
+            kwargs['qos'] = 'debug'
+        # kwargs['env'] = {'STEP': self.job_type, 'SAMPLE': self.sample}
+        self.write_sbatch(sh_f, outbase, self.wdl, self.shifter_conf, self.cw_jar, **kwargs)
+        sh_f.flush()
+
+        outdir = sh_path
 
         jobid = None
         if submit:
@@ -67,18 +103,22 @@ class CromwellJob(abc.ABCMeta):
                 exit()
             outdir = f"{outbase}.{jobid}"
 
-            os.mkdirs(outdir)
+            os.makedirs(outdir)
             shutil.copyfile(sh_path, f"{outdir}.sh")
             shutil.copyfile(inputs_path, f"{outdir}/inputs.json")
+        else:
+            with open(inputs_path, 'r') as f:
+                print(f.read())
+            print()
+            with open(sh_path, 'r') as f:
+                print(f.read())
 
         self.outdir = outdir
         self.jobid = jobid
         return outdir, jobid
 
-    def _submit_job(self, path, conda_env=None):
+    def _submit_job(self, path):
         cmd = f'sbatch {path}'
-        if conda_env is not None:
-            cmd = f'conda run -n {conda_env} {cmd}'
         print(cmd)
         output = subprocess.check_output(
                     cmd,
@@ -93,119 +133,83 @@ class CromwellJob(abc.ABCMeta):
             ret = -1
         return ret
 
-    def get_final_output(self, filename)
+    def get_final_output(self, filename):
         if self.outdir is not None:
             return os.path.join(self.outdir, filename)
         return None
 
+    @abc.abstractmethod
+    def get_outputs(self):
+        pass
 
-class QCJob(CromwellJob):
+    @classmethod
+    def add_bp_args(cls, parser):
+        parser.add_argument('-o', '--outdir', type=str, help='the output directory for the job', default='.')
+        parser.add_argument('-s', '--submit', action='store_true', help='submit job', default=False)
+        parser.add_argument('-d', '--debug', action='store_true', help='submit to debug queue', default=False)
 
-    def __init__(self, fastq, config):
-        inputs = {
-            "jgi_rqcfilter.database": config['database'],
-            "jgi_rqcfilter.input_files": [fastq],
-            "jgi_rqcfilter.input_interleaved": True,
-            "jgi_rqcfilter.input_fq1": [],
-            "jgi_rqcfilter.input_fq2": [],
-            "jgi_rqcfilter.outdir": "./",
-            "jgi_rqcfilter.memory": "35G",
-            "jgi_rqcfilter.threads": "16"
-        }
-        super().__init__(inputs, config)
-        self._output_fq = os.path.basename(fastq).replace('.fastq', '.anqdpht.fastq')
+    @classmethod
+    @abc.abstractmethod
+    def add_args(self, parser):
+        pass
 
-    @property
-    def cleaned_fastq(self):
-        return self.get_final_output(self._output_fq)
+    @classmethod
+    @abc.abstractmethod
+    def run(cls, **config):
+        pass
 
-
-class AssemblyJob(CromwellJob):
-
-    def __init__(self, fastq, config):
-        inputs = {
-            "jgi_metaASM.input_file":[fastq],
-            "jgi_metaASM.rename_contig_prefix": config['rename_contig_prefix'],
-            "jgi_metaASM.outdir": ".",
-            "jgi_metaASM.input_interleaved": True,
-            "jgi_metaASM.input_fq1":[],
-            "jgi_metaASM.input_fq2":[],
-            "jgi_metaASM.memory": "105G",
-            "jgi_metaASM.threads": "16"
-        }
-        super().__init__(inputs, config)
-        self._output_fna = "assembly_scaffolds.fna"
-        self._output_bam = "pairedMapped_sorted.bam"
-
-    @property
-    def assembly_fasta(self):
-        return self.get_final_output(self._output_fna)
-
-    @property
-    def mapped_reads(self):
-        return self.get_final_output(self._output_bam)
-
-
-class RBAJob(CromwellJob):
-
-    def __init__(self, fastq, config):
-        inputs = {
-              "ReadbasedAnalysis.input_file": fastq,
-              "ReadbasedAnalysis.paired": True,
-              "ReadbasedAnalysis.prefix": "TEST",
-              "ReadbasedAnalysis.cpu": 8,
-              "ReadbasedAnalysis.proj": "TEST",
-              "ReadbasedAnalysis.resource": "NERSC - PERLMUTTER",
-              "ReadbasedAnalysis.informed_by": "None"
-            }
-
-class AnnotationJob(CromwellJob):
-
-    def __init__(self, fasta, config):
-        inputs = {
-              "annotation.input_file": fasta,
-              "annotation.imgap_project_id": prefix,
-              "annotation.proj": prefix,
-              "annotation.resource": "NERSC - PERLMUTTER",
-              "annotation.informed_by": "None"
-            }
-
-
-
-if __name__ == '__main__':
-
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('fastq', help='The interleaved Fastq to run workflow with')
-
-
-    # CromwellJob(inputs_dict, wdl, shifter_conf, **xx_args):
-
-    raw_fastq = args.fastq
-    with open(args.config, 'rb') as f:
-        config = tomllib.load(f)
-
-    qc_wdl = config['qc']['wdl']
-    rqc_db = config['qc']['database']
-    qc_
-
-    qc_inputs = get_qc_io(rqc_db, raw_fastq)
-    qc_job = CromwellJob(qc_inputs, qc_wdl, )
-    qc_outdir, qc_jobid = qc_job.submit_workflow(...)
-
-
-    asm_job = CromwellJob(...)
-
-    outdir, asm_jobid = asm_job.submit_workflow(...)
-
-
-
-    _job = CromwellJob(...)
-
-    _job.submit_workflow(..., dep=asm_jobid)
-
-
-
-
-
+# class AssemblyJob(CromwellJob):
+#
+#     def __init__(self, config, *inputs):
+#         fastq = inputs[0]
+#         inputs = {
+#             "jgi_metaASM.input_file":[fastq],
+#             "jgi_metaASM.rename_contig_prefix": config['rename_contig_prefix'],
+#             "jgi_metaASM.outdir": ".",
+#             "jgi_metaASM.input_interleaved": True,
+#             "jgi_metaASM.input_fq1":[],
+#             "jgi_metaASM.input_fq2":[],
+#             "jgi_metaASM.memory": "105G",
+#             "jgi_metaASM.threads": "16"
+#         }
+#         super().__init__(inputs, config)
+#         self._output_fna = "assembly_scaffolds.fna"
+#         self._output_bam = "pairedMapped_sorted.bam"
+#
+#     @property
+#     def assembly_fasta(self):
+#         return self.get_final_output(self._output_fna)
+#
+#     @property
+#     def mapped_reads(self):
+#         return self.get_final_output(self._output_bam)
+#
+#
+# class RBAJob(CromwellJob):
+#
+#     def __init__(self, config, *inputs):
+#         fastq = inputs[0]
+#         inputs = {
+#               "ReadbasedAnalysis.input_file": fastq,
+#               "ReadbasedAnalysis.paired": True,
+#               "ReadbasedAnalysis.prefix": "TEST",
+#               "ReadbasedAnalysis.cpu": 8,
+#               "ReadbasedAnalysis.proj": "TEST",
+#               "ReadbasedAnalysis.resource": "NERSC - PERLMUTTER",
+#               "ReadbasedAnalysis.informed_by": "None"
+#             }
+#
+# class AnnotationJob(CromwellJob):
+#
+#     def __init__(self, config, *inputs):
+#         fasta = inputs[0]
+#         prefix = inputs[1]
+#         inputs = {
+#               "annotation.input_file": fasta,
+#               "annotation.imgap_project_id": prefix,
+#               "annotation.proj": prefix,
+#               "annotation.resource": "NERSC - PERLMUTTER",
+#               "annotation.informed_by": "None"
+#             }
+#
+#
